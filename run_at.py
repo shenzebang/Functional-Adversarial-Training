@@ -26,13 +26,14 @@ norm = Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 epsilon = 2./255
 
 
-def fgd_step(f, data, label, step_size, oracle_n_steps, oracle_step_size, oracle_mb_size, init_weak_learner):
-    f_data = f(data)
-    target = Dx_loss(f_data, label)
-    target = target.detach()
-    g, _, _ = weak_oracle(target, data, oracle_step_size,
-                          oracle_n_steps, init_weak_learner=init_weak_learner, mb_size=oracle_mb_size)
-    f.add_function(g, -step_size)
+def sgd_step(f, data, label, sgd_n_steps, sgd_step_size, sgd_mb_size):
+    opt = optim.SGD(f.parameters(), lr=sgd_step_size)
+    for i in range(sgd_n_steps):
+        opt.zero_grad()
+        index = torch.randint(data.shape[0], [sgd_mb_size])
+        loss_f = loss(f(data[index]), label[index])
+        loss_f.backward()
+        opt.step()
 
 def attack_step(model, data, label, mb_size=128):
     delta = torch.zeros_like(data, requires_grad=True)
@@ -54,18 +55,17 @@ def attack_step(model, data, label, mb_size=128):
     return delta
 if __name__ == '__main__':
     ts = time.time()
-    algo = 'fat'
+    algo = 'at'
     parser = argparse.ArgumentParser(algo)
 
     parser.add_argument('--dataset', type=str, default='cifar')
     parser.add_argument('--weak_learner_hid_dims', type=str, default='32-32')
-    parser.add_argument('--step_size_0', type=float, default=20.0)
+    parser.add_argument('--sgd_step_size', type=float, default=0.005)
     parser.add_argument('--loss', type=str, choices=['cross_entropy'], default='cross_entropy')
-    parser.add_argument('--oracle_n_steps', type=int, default=1000)
-    parser.add_argument('--fgd_n_steps', type=int, default=1)
+    parser.add_argument('--sgd_n_steps', type=int, default=100)
     parser.add_argument('--oracle_step_size', type=float, default=0.001)
     parser.add_argument('--p', type=float, default=1, help='step size decay exponential')
-    parser.add_argument('--oracle_mb_size', type=int, default=128)
+    parser.add_argument('--sgd_mb_size', type=int, default=128)
     parser.add_argument('--n_global_rounds', type=int, default=100)
     parser.add_argument('--device', type=str, default="cuda")
 
@@ -73,7 +73,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     writer = SummaryWriter(
-        f'out/{args.dataset}/{args.weak_learner_hid_dims}/rhog{args.step_size_0}_mb{args.oracle_mb_size}_p{args.p}_{algo}_{ts}'
+        f'out/{args.dataset}/{args.weak_learner_hid_dims}/rhog{args.sgd_step_size}_mb{args.sgd_mb_size}_p{args.p}_{algo}_{ts}'
     )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -86,29 +86,26 @@ if __name__ == '__main__':
 
     Dx_loss = Dx_losses[args.loss]
     loss = losses[args.loss]
-    f_ens = FunctionEnsemble(get_init_function=get_init_weak_learner, device=device)
+    f = get_init_weak_learner()
+    f.requires_grad_(True)
     delta = None
 
     for r in tqdm(range(args.n_global_rounds)):
-        # fgd step
-        for i in range(args.fgd_n_steps):
-            step_size = args.step_size_0/(r*args.fgd_n_steps + i +1)
-            fgd_step(f=f_ens,
-                     data=data if delta is None else (data+delta).detach(),
-                     label=label,
-                     step_size=step_size,
-                     oracle_n_steps=args.oracle_n_steps,
-                     oracle_step_size=args.oracle_step_size,
-                     oracle_mb_size=args.oracle_mb_size,
-                     init_weak_learner=get_init_weak_learner()
-                     )
+        # sgd step
+        sgd_step(f=f,
+                 data=data if delta is None else (data+delta).detach(),
+                 label=label,
+                 sgd_step_size=args.sgd_step_size,
+                 sgd_n_steps=args.sgd_n_steps,
+                 sgd_mb_size=args.sgd_mb_size
+                 )
         # attack step
-        delta = attack_step(model=f_ens,
+        delta = attack_step(model=f,
                             data=data,
                             label=label
                             )
         # test on natural data
-        f_data_test = f_ens(data_test)
+        f_data_test = f(data_test)
         loss_round = loss(f_data_test, label_test)
         writer.add_scalar(
             f"global loss vs round, {args.dataset}/natural_test",
@@ -120,11 +117,11 @@ if __name__ == '__main__':
             correct, r)
 
         # test on adversarial data
-        delta_test = attack_step(model=f_ens,
+        delta_test = attack_step(model=f,
                             data=data_test,
                             label=label_test
                             )
-        f_data_test = f_ens(data_test+delta_test)
+        f_data_test = f(data_test+delta_test)
         loss_round = loss(f_data_test, label_test)
         writer.add_scalar(
             f"global loss vs round, {args.dataset}/adv_test",
