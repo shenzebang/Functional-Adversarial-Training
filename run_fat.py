@@ -16,14 +16,13 @@ Dx_losses = {
 }
 losses = {
     "logistic_regression": 123,
-    "cross_entropy": lambda x, y: torch.nn.functional.cross_entropy(x, y, reduction='sum')
+    "cross_entropy": lambda x, y: torch.nn.functional.cross_entropy(x, y)
 }
 
 
 # todo: manage the gpu id
 # todo: BUG when n_data mod n_workers is non-zero
 norm = Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-epsilon = 2./255
 
 
 def fgd_step(f, data, label, step_size, oracle_n_steps, oracle_step_size, oracle_mb_size, init_weak_learner):
@@ -34,24 +33,38 @@ def fgd_step(f, data, label, step_size, oracle_n_steps, oracle_step_size, oracle
                           oracle_n_steps, init_weak_learner=init_weak_learner, mb_size=oracle_mb_size)
     f.add_function(g, -step_size)
 
-def attack_step(model, data, label, mb_size=128):
+def attack_step(model, data, label, epsilon, attack_lr=5e-3, mb_size=128):
     delta = torch.zeros_like(data, requires_grad=True)
-    opt = optim.SGD([delta], lr=5e-3)
 
-    # chunk the data due to GPU memory limitation
-    full_index = range(data.shape[0])
-    index_list = chunks(full_index, mb_size)
-    for index in index_list:
-        for t in range(100):
-            pred = model(norm(data[index] + delta[index]))
-            loss = -nn.CrossEntropyLoss()(pred, label[index])
+    if epsilon > 0:
+        opt = optim.SGD([delta], lr=attack_lr)
 
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            delta[index].data.clamp_(-epsilon, epsilon)
+        if mb_size > 0:
+            # chunk the data due to GPU memory limitation
+            full_index = range(data.shape[0])
+            index_list = chunks(full_index, mb_size)
+            for index in index_list:
+                for t in range(100):
+                    pred = model(norm(data[index] + delta[index]))
+                    loss = -nn.CrossEntropyLoss()(pred, label[index])
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    delta[index].data.clamp_(-epsilon, epsilon)
+        else:
+            for t in range(100):
+                pred = model(norm(data + delta))
+                loss = -nn.CrossEntropyLoss()(pred, label)
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                delta.data.clamp_(-epsilon, epsilon)
 
     return delta
+
+
 if __name__ == '__main__':
     ts = time.time()
     algo = 'fat'
@@ -68,16 +81,19 @@ if __name__ == '__main__':
     parser.add_argument('--oracle_mb_size', type=int, default=128)
     parser.add_argument('--n_global_rounds', type=int, default=100)
     parser.add_argument('--device', type=str, default="cuda")
+    parser.add_argument('--epsilon_adv', type=int, default=8)
+    parser.add_argument('--attack_lr', type=float, default=0.005)
 
 
     args = parser.parse_args()
 
     writer = SummaryWriter(
-        f'out/{args.dataset}/{args.weak_learner_hid_dims}/rhog{args.step_size_0}_mb{args.oracle_mb_size}_p{args.p}_{algo}_{ts}'
+        f'out/{args.dataset}/epsilon{args.epsilon_adv}/{args.weak_learner_hid_dims}/rhog{args.step_size_0}_mb{args.oracle_mb_size}_p{args.p}_{algo}_{ts}'
     )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     hidden_size = tuple([int(a) for a in args.weak_learner_hid_dims.split("-")])
+    epsilon = float(args.epsilon_adv) / 255
 
     # Load/split training data
 
@@ -90,11 +106,18 @@ if __name__ == '__main__':
     delta = None
 
     for r in tqdm(range(args.n_global_rounds)):
+        # attack step
+        delta = attack_step(model=f_ens,
+                            data=data,
+                            label=label,
+                            epsilon=epsilon,
+                            attack_lr=args.attack_lr
+                            )
         # fgd step
         for i in range(args.fgd_n_steps):
             step_size = args.step_size_0/(r*args.fgd_n_steps + i +1)
             fgd_step(f=f_ens,
-                     data=data if delta is None else (data+delta).detach(),
+                     data=(data+delta).detach(),
                      label=label,
                      step_size=step_size,
                      oracle_n_steps=args.oracle_n_steps,
@@ -102,11 +125,6 @@ if __name__ == '__main__':
                      oracle_mb_size=args.oracle_mb_size,
                      init_weak_learner=get_init_weak_learner()
                      )
-        # attack step
-        delta = attack_step(model=f_ens,
-                            data=data,
-                            label=label
-                            )
         # test on natural data
         f_data_test = f_ens(data_test)
         loss_round = loss(f_data_test, label_test)
@@ -122,8 +140,11 @@ if __name__ == '__main__':
         # test on adversarial data
         delta_test = attack_step(model=f_ens,
                             data=data_test,
-                            label=label_test
+                            label=label_test,
+                            epsilon=epsilon,
+                            attack_lr=args.attack_lr
                             )
+
         f_data_test = f_ens(data_test+delta_test)
         loss_round = loss(f_data_test, label_test)
         writer.add_scalar(
